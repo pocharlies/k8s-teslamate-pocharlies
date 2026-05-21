@@ -66,6 +66,7 @@ spec:
   target:
     name: teslamate-postgres-creds
     creationPolicy: Owner
+    deletionPolicy: Retain
   data:
     - secretKey: username
       remoteRef: { key: secret/teslamate, property: DB_USER }
@@ -86,6 +87,7 @@ spec:
   target:
     name: teslamate-secrets
     creationPolicy: Owner
+    deletionPolicy: Retain
   dataFrom:
     - extract:
         key: secret/teslamate
