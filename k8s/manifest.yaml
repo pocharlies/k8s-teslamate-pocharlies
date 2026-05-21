@@ -1,0 +1,250 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: teslamate
+  labels:
+    cnpg-backup: "true"   # triggers ClusterExternalSecret minio-backup-creds
+---
+# TeslaMate — Tesla vehicle tracking
+# Stack: teslamate-web + teslamate-postgres + teslamate-mosquitto
+# teslamate-grafana runs separately (connects to existing VictoriaMetrics/Grafana)
+#
+# Migration strategy (Phase 9):
+#   1. pg_dump from docker teslamate-postgres → restore in CloudNativePG cluster
+#   2. Mosquitto: copy persistence file (teslamate data is reconnected from Tesla API)
+#   3. teslamate connects to MQTT broker by env var — service name transparent to app
+
+# ── PostgreSQL (CloudNativePG) ────────────────────────────────────────────────
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: teslamate-postgres
+  namespace: teslamate
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  storage:
+    storageClass: longhorn
+    size: 10Gi
+  postgresql:
+    parameters:
+      max_connections: "100"
+      shared_buffers: "128MB"
+  bootstrap:
+    initdb:
+      database: teslamate
+      owner: teslamate
+      secret:
+        name: teslamate-postgres-creds
+  # Backup to MinIO (S3)
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://velero-backups/teslamate-postgres/
+      endpointURL: http://minio-s3.minio.svc.cluster.local:9000
+      s3Credentials:
+        accessKeyId:
+          name: minio-backup-creds
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: minio-backup-creds
+          key: SECRET_ACCESS_KEY
+      wal:
+        compression: gzip
+---
+# ExternalSecret: teslamate DB credentials
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: teslamate-postgres-creds
+  namespace: teslamate
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: ClusterSecretStore
+  target:
+    name: teslamate-postgres-creds
+    creationPolicy: Owner
+  data:
+    - secretKey: username
+      remoteRef: { key: secret/teslamate, property: DB_USER }
+    - secretKey: password
+      remoteRef: { key: secret/teslamate, property: DB_PASSWORD }
+---
+# ExternalSecret: teslamate app secrets
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: teslamate-secrets
+  namespace: teslamate
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: ClusterSecretStore
+  target:
+    name: teslamate-secrets
+    creationPolicy: Owner
+  dataFrom:
+    - extract:
+        key: secret/teslamate
+---
+# ── Mosquitto MQTT broker ─────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mosquitto-data
+  namespace: teslamate
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+  storageClassName: longhorn
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mosquitto-config
+  namespace: teslamate
+data:
+  mosquitto.conf: |
+    listener 1883
+    allow_anonymous true
+    persistence true
+    persistence_location /mosquitto/data/
+    log_dest stdout
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teslamate-mosquitto
+  namespace: teslamate
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: teslamate-mosquitto } }
+  template:
+    metadata: { labels: { app: teslamate-mosquitto } }
+    spec:
+      enableServiceLinks: false
+      nodeSelector:
+        topology: lan
+        kubernetes.io/arch: amd64
+      containers:
+        - name: mosquitto
+          image: eclipse-mosquitto:2
+          ports:
+            - { name: mqtt, containerPort: 1883 }
+          volumeMounts:
+            - { name: config, mountPath: /mosquitto/config }
+            - { name: data,   mountPath: /mosquitto/data }
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits:   { memory: 128Mi }
+      volumes:
+        - name: config
+          configMap: { name: mosquitto-config }
+        - name: data
+          persistentVolumeClaim: { claimName: mosquitto-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: teslamate-mosquitto
+  namespace: teslamate
+spec:
+  selector: { app: teslamate-mosquitto }
+  ports:
+    - { name: mqtt, port: 1883, targetPort: 1883 }
+
+# ── TeslaMate web ─────────────────────────────────────────────────────────────
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teslamate
+  namespace: teslamate
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: teslamate } }
+  template:
+    metadata: { labels: { app: teslamate } }
+    spec:
+      enableServiceLinks: false
+      nodeSelector:
+        topology: lan
+        kubernetes.io/arch: amd64
+      initContainers:
+        # Wait for CloudNativePG to be ready
+        - name: wait-db
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h teslamate-postgres-rw.teslamate.svc.cluster.local -p 5432; do
+                echo "waiting for postgres..."; sleep 3; done
+          env:
+            - { name: PGPASSWORD, valueFrom: { secretKeyRef: { name: teslamate-secrets, key: DB_PASSWORD } } }
+      containers:
+        - name: teslamate
+          image: teslamate/teslamate:latest
+          ports:
+            - { name: http, containerPort: 4000 }
+          env:
+            # Use native teslamate DB env vars (avoid $(VAR) interpolation from envFrom)
+            - name: DATABASE_USER
+              valueFrom: { secretKeyRef: { name: teslamate-secrets, key: DB_USER } }
+            - name: DATABASE_PASS
+              valueFrom: { secretKeyRef: { name: teslamate-secrets, key: DB_PASSWORD } }
+            - { name: DATABASE_NAME, value: "teslamate" }
+            - { name: DATABASE_HOST, value: "teslamate-postgres-rw.teslamate.svc.cluster.local" }
+            - name: ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: teslamate-secrets, key: ENCRYPTION_KEY } }
+            - { name: MQTT_HOST, value: "teslamate-mosquitto.teslamate.svc.cluster.local" }
+            - { name: DISABLE_MQTT, value: "false" }
+            - { name: TZ, value: "Europe/Madrid" }
+            - name: TESLA_AUTH_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: teslamate-secrets, key: TESLA_AUTH_CLIENT_ID, optional: true } }
+            - name: TESLA_AUTH_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: teslamate-secrets, key: TESLA_AUTH_CLIENT_SECRET, optional: true } }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { memory: 512Mi }
+          readinessProbe:
+            tcpSocket: { port: 4000 }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          livenessProbe:
+            tcpSocket: { port: 4000 }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: teslamate
+  namespace: teslamate
+spec:
+  selector: { app: teslamate }
+  ports:
+    - { name: http, port: 80, targetPort: 4000 }
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: teslamate-lan
+  namespace: teslamate
+spec:
+  entryPoints: [websecure]
+  routes:
+    - match: Host(`teslamate.lan.e-dani.com`)
+      kind: Rule
+      services:
+        - name: teslamate
+          port: 80
+      middlewares:
+        - { name: authelia, namespace: authelia }
+  tls:
+    secretName: wildcard-lan-tls
