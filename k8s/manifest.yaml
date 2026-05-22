@@ -185,7 +185,7 @@ spec:
             - sh
             - -c
             - |
-              until pg_isready -h teslamate-postgres-rw.teslamate.svc.cluster.local -p 5432; do
+              until pg_isready -h postgres-shared-rw.databases.svc.cluster.local -p 5432; do
                 echo "waiting for postgres..."; sleep 3; done
           env:
             - { name: PGPASSWORD, valueFrom: { secretKeyRef: { name: teslamate-secrets, key: DB_PASSWORD } } }
@@ -201,7 +201,7 @@ spec:
             - name: DATABASE_PASS
               valueFrom: { secretKeyRef: { name: teslamate-secrets, key: DB_PASSWORD } }
             - { name: DATABASE_NAME, value: "teslamate" }
-            - { name: DATABASE_HOST, value: "teslamate-postgres-rw.teslamate.svc.cluster.local" }
+            - { name: DATABASE_HOST, value: "postgres-shared-rw.databases.svc.cluster.local" }
             - name: ENCRYPTION_KEY
               valueFrom: { secretKeyRef: { name: teslamate-secrets, key: ENCRYPTION_KEY } }
             - { name: MQTT_HOST, value: "teslamate-mosquitto.teslamate.svc.cluster.local" }
