@@ -6,7 +6,8 @@ metadata:
 ---
 # TeslaMate — Tesla vehicle tracking
 # Stack: teslamate-web + teslamate-mosquitto
-# teslamate-grafana runs separately (connects to existing VictoriaMetrics/Grafana)
+# teslamate-grafana is codified below; it serves the upstream TeslaMate
+# dashboards and connects to the shared Postgres database.
 #
 # Migration strategy (Phase 9):
 #   1. pg_dump from docker teslamate-postgres → restore in CloudNativePG cluster
@@ -190,3 +191,92 @@ spec:
         - { name: authelia, namespace: authelia }
   tls:
     store: { name: default, namespace: traefik-lan }
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: teslamate-grafana
+---
+# ── TeslaMate Grafana dashboards ─────────────────────────────────────────────
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: teslamate-grafana-secrets
+  namespace: teslamate-grafana
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: ClusterSecretStore
+  target:
+    name: teslamate-grafana-secrets
+    # Merge into the pre-existing Secret so the manually seeded Grafana admin
+    # password is preserved until Vault write policy allows storing it there.
+    creationPolicy: Merge
+    deletionPolicy: Retain
+  data:
+    - secretKey: DB_PASS
+      remoteRef:
+        key: secret/teslamate
+        property: DB_PASSWORD
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: teslamate-grafana-data
+  namespace: teslamate-grafana
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+  storageClassName: longhorn
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teslamate-grafana
+  namespace: teslamate-grafana
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: teslamate-grafana } }
+  template:
+    metadata: { labels: { app: teslamate-grafana } }
+    spec:
+      securityContext:
+        fsGroup: 472
+      containers:
+        - name: grafana
+          image: teslamate/grafana:latest
+          ports:
+            - { name: http, containerPort: 3000 }
+          env:
+            - { name: DATABASE_USER, value: "teslamate" }
+            - { name: DATABASE_NAME, value: "teslamate" }
+            - { name: DATABASE_HOST, value: "postgres-shared-rw.databases.svc.cluster.local" }
+            - name: DATABASE_PASS
+              valueFrom: { secretKeyRef: { name: teslamate-grafana-secrets, key: DB_PASS } }
+            - { name: GF_SECURITY_ADMIN_USER, value: "admin" }
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: teslamate-grafana-secrets, key: GF_ADMIN_PASS } }
+            - { name: GF_AUTH_ANONYMOUS_ENABLED, value: "false" }
+            - { name: GF_SERVER_ROOT_URL, value: "https://teslamate.e-dani.com/grafana/" }
+            - { name: GF_SERVER_SERVE_FROM_SUB_PATH, value: "true" }
+            - { name: TZ, value: "Europe/Madrid" }
+          readinessProbe:
+            httpGet: { path: /api/health, port: 3000 }
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/grafana }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: teslamate-grafana-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: teslamate-grafana
+  namespace: teslamate-grafana
+spec:
+  selector: { app: teslamate-grafana }
+  ports:
+    - { name: http, port: 3000, targetPort: 3000 }
